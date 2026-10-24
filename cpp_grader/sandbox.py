@@ -1,0 +1,132 @@
+from __future__ import annotations
+import os
+import shutil
+import subprocess
+from pathlib import Path
+from typing import Any
+from .errors import SandboxUnavailableError
+
+
+def sandbox_mode(config: Any) -> str:
+    return str(config.section("execution").get("sandbox", "required"))
+
+
+def _bwrap_system_mounts() -> list[str]:
+    """Mount only system runtime/compiler directories; never the user's home."""
+    args = ["--ro-bind", "/usr", "/usr"]
+    if Path("/etc").exists():
+        args += ["--ro-bind", "/etc", "/etc"]
+    for path in ("/bin", "/sbin", "/lib", "/lib64"):
+        p = Path(path)
+        if not p.exists() and not p.is_symlink():
+            continue
+        if p.is_symlink():
+            args += ["--symlink", os.readlink(path), path]
+        else:
+            args += ["--ro-bind", path, path]
+    return args
+
+
+def sandbox_probe() -> dict[str, Any]:
+    bwrap = shutil.which("bwrap")
+    prlimit = shutil.which("prlimit")
+    result: dict[str, Any] = {"bwrap": bwrap, "prlimit": prlimit, "ready": False, "message": ""}
+    if not prlimit:
+        result["message"] = "prlimit is unavailable; OS-level resource limits cannot be enforced. Install util-linux."
+        return result
+    if not bwrap:
+        result["message"] = "bubblewrap (bwrap) is unavailable. Required sandbox mode will refuse to execute submissions."
+        return result
+    args = [bwrap, "--die-with-parent", "--new-session", "--unshare-all", *_bwrap_system_mounts(),
+            "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--setenv", "HOME", "/tmp",
+            "--setenv", "PATH", "/usr/bin:/bin", "--chdir", "/", "--", "/usr/bin/true"]
+    try:
+        cp = subprocess.run(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            timeout=5, check=False, env={"PATH": "/usr/bin:/bin", "HOME": "/tmp"})
+        result["ready"] = cp.returncode == 0
+        result["message"] = "bubblewrap smoke test passed" if cp.returncode == 0 else (
+            "bubblewrap exists but its namespace/mount setup failed: " + cp.stderr.decode("utf-8", "replace")[-1000:]
+        )
+    except Exception as exc:
+        result["message"] = f"bubblewrap smoke test failed: {type(exc).__name__}: {exc}"
+    return result
+
+
+def build_command(command: list[str], workspace: Path, config: Any, *, phase: str, readonly: bool = False) -> list[str]:
+    mode = sandbox_mode(config)
+    if mode not in {"required", "unsafe"}:
+        raise SandboxUnavailableError(f"Unsupported sandbox mode {mode!r}.")
+    limit_bin = shutil.which("prlimit")
+    if not limit_bin:
+        raise SandboxUnavailableError("prlimit is required for hard resource limits; install util-linux.")
+    if phase == "compile":
+        cpu = int(config.section("compiler").get("compile_cpu_seconds", 45))
+        memory_mb = int(config.section("compiler").get("memory_mb", 2048))
+        fsize = int(config.section("compiler").get("max_binary_bytes", 52_428_800))
+    else:
+        ex = config.section("execution")
+        cpu = int(ex.get("cpu_seconds", 3))
+        memory_mb = int(ex.get("memory_mb", 256))
+        fsize = int(ex.get("max_output_bytes", 1_048_576))
+    limited = [
+        limit_bin,
+        f"--cpu={max(1, cpu)}",
+        f"--as={memory_mb * 1024 * 1024}",
+        f"--fsize={max(1024, fsize)}",
+        f"--nofile={int(config.section('execution').get('max_open_files', 64))}",
+        "--core=0",
+    ]
+
+    # RLIMIT_NPROC is counted by real UID on Linux, so a low limit can
+    # block trusted test/compiler subprocesses when the desktop session
+    # already owns many threads. Unsafe mode is for trusted code only.
+    # Keep the process limit in the isolated required-sandbox mode.
+    if mode == "required":
+        limited.append(
+            f"--nproc={int(config.section('execution').get('max_processes', 64))}"
+        )
+
+    limited.extend(["--", *command])
+    if mode == "unsafe":
+        return limited
+    bwrap = shutil.which("bwrap")
+    if not bwrap:
+        raise SandboxUnavailableError("bubblewrap (bwrap) is required by execution.sandbox='required'. Install it or explicitly opt into unsafe mode only for trusted code.")
+    tmpfs_mb = max(16, int(config.section("execution").get("tmpfs_mb", 128)))
+    args = [bwrap, "--die-with-parent", "--new-session", "--unshare-all", *_bwrap_system_mounts(),
+            "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--dir", "/work"]
+    args += (["--bind", str(workspace.resolve()), "/work"] if not readonly else ["--ro-bind", str(workspace.resolve()), "/work"])
+    args += ["--chdir", "/work", "--setenv", "HOME", "/tmp", "--setenv", "TMPDIR", "/tmp",
+             "--setenv", "PATH", "/usr/bin:/bin", "--setenv", "LC_ALL", "C", "--", *limited]
+    return args
+
+
+def _available_memory_mb() -> int | None:
+    # Prefer Linux's MemAvailable (not total memory); gracefully fall back when unavailable.
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) // 1024
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def effective_workers(config: Any) -> int:
+    execution = config.section("execution")
+    cores = os.cpu_count() or 2
+    reserve = max(0, int(execution.get("worker_reserve_cores", 2)))
+    safe = max(1, cores - reserve)
+    configured = execution.get("max_workers")
+    if configured is not None:
+        safe = min(safe, max(1, int(configured)))
+    # Limit aggregate worst-case compile memory as well as CPU concurrency.
+    available = _available_memory_mb()
+    per_worker = (int(config.section("compiler").get("memory_mb", 2048))
+                  + int(execution.get("memory_mb", 256))
+                  + int(execution.get("tmpfs_mb", 128)) + 256)
+    mem_reserve = max(512, int(execution.get("worker_memory_reserve_mb", 1024)))
+    if available is not None:
+        memory_cap = max(1, (max(0, available - mem_reserve)) // max(1, per_worker))
+        safe = min(safe, memory_cap)
+    return max(1, safe)

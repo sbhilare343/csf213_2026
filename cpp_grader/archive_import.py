@@ -1,0 +1,544 @@
+from __future__ import annotations
+
+from collections import Counter
+from dataclasses import dataclass
+import hashlib
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import resource
+import shutil
+import signal
+import stat
+import subprocess
+import tempfile
+from typing import Any
+import zipfile
+
+from .config import AppConfig
+from .errors import InputValidationError
+from .utils import json_write, sha256_file
+
+
+@dataclass(frozen=True)
+class ArchiveImportSummary:
+    archive: str
+    destination: str
+    student_folders: int
+    ready_cpp_submissions: int
+    no_cpp_source: int
+    ambiguous_roots: int
+    import_errors: int
+    warnings: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "archive": self.archive,
+            "destination": self.destination,
+            "student_folders": self.student_folders,
+            "ready_cpp_submissions": self.ready_cpp_submissions,
+            "no_cpp_source": self.no_cpp_source,
+            "ambiguous_roots": self.ambiguous_roots,
+            "import_errors": self.import_errors,
+            "warnings": list(self.warnings),
+        }
+
+
+def _ignored(rel: Path, ignored: set[str]) -> bool:
+    return any(part in ignored or part.startswith("._") or part == ".DS_Store" for part in rel.parts)
+
+
+def _normal_zip_path(raw: str) -> PurePosixPath:
+    # Treat backslashes as separators so Windows-style traversal is rejected on Linux too.
+    cleaned = raw.replace("\\", "/")
+    path = PurePosixPath(cleaned)
+    if not cleaned or cleaned.startswith("/") or re.match(r"^[A-Za-z]:", cleaned):
+        raise InputValidationError(f"Unsafe absolute path in ZIP entry: {raw!r}")
+    if any(part in {"..", ""} for part in path.parts):
+        raise InputValidationError(f"Path traversal in ZIP entry: {raw!r}")
+    if "\x00" in cleaned:
+        raise InputValidationError("NUL byte in ZIP entry name.")
+    return path
+
+
+def safe_extract_zip(
+    archive: Path,
+    destination: Path,
+    *,
+    max_entries: int,
+    max_uncompressed_bytes: int,
+    budget: dict[str, int] | None = None,
+) -> dict[str, int]:
+    """Extract a ZIP without path traversal, symlinks, or unbounded expansion."""
+    if not zipfile.is_zipfile(archive):
+        raise InputValidationError(f"Not a valid ZIP archive: {archive}")
+    destination.mkdir(parents=True, exist_ok=True)
+    destination = destination.resolve()
+    local_budget = budget if budget is not None else {"entries": 0, "bytes": 0}
+    try:
+        with zipfile.ZipFile(archive, "r") as bundle:
+            entries = bundle.infolist()
+            if len(entries) > max_entries:
+                raise InputValidationError(f"ZIP {archive.name} has {len(entries)} entries; limit is {max_entries}.")
+            planned_size = sum(max(0, item.file_size) for item in entries if not item.is_dir())
+            if planned_size > max_uncompressed_bytes:
+                raise InputValidationError(
+                    f"ZIP {archive.name} expands to {planned_size} bytes; limit is {max_uncompressed_bytes}."
+                )
+            for info in entries:
+                leaf = info.filename.rsplit("/", 1)[-1]
+                if leaf == ".DS_Store" or leaf.startswith("._") or info.filename.startswith("__MACOSX/"):
+                    continue
+                relative = _normal_zip_path(info.filename)
+                mode = (info.external_attr >> 16) & 0xFFFF
+                if stat.S_ISLNK(mode):
+                    raise InputValidationError(f"Symbolic-link ZIP entry is not permitted: {info.filename!r}")
+                target = (destination / Path(*relative.parts)).resolve()
+                if target != destination and destination not in target.parents:
+                    raise InputValidationError(f"ZIP entry escapes destination: {info.filename!r}")
+                if info.is_dir():
+                    target.mkdir(parents=True, exist_ok=True)
+                    continue
+                local_budget["entries"] = local_budget.get("entries", 0) + 1
+                if local_budget["entries"] > max_entries:
+                    raise InputValidationError("Combined archive entry count exceeds the configured limit.")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                written = 0
+                with bundle.open(info, "r") as source, target.open("wb") as output:
+                    while True:
+                        chunk = source.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        written += len(chunk)
+                        local_budget["bytes"] = local_budget.get("bytes", 0) + len(chunk)
+                        if local_budget["bytes"] > max_uncompressed_bytes:
+                            raise InputValidationError("Combined archive uncompressed size exceeds the configured limit.")
+                        output.write(chunk)
+                if written != info.file_size:
+                    raise InputValidationError(f"Unexpected uncompressed size for ZIP entry {info.filename!r}.")
+    except (zipfile.BadZipFile, OSError, RuntimeError) as exc:
+        if isinstance(exc, InputValidationError):
+            raise
+        raise InputValidationError(f"Could not safely extract {archive}: {type(exc).__name__}: {exc}") from exc
+    return local_budget
+
+
+def _walk_files(root: Path, ignored_dirs: set[str]) -> list[Path]:
+    found: list[Path] = []
+    for current, dirs, files in os.walk(root, followlinks=False):
+        base = Path(current)
+        dirs[:] = sorted(
+            name for name in dirs
+            if name not in ignored_dirs and name not in {".git", ".gradle", "__MACOSX"}
+            and not name.startswith("._") and not (base / name).is_symlink()
+        )
+        for name in sorted(files):
+            path = base / name
+            if path.is_symlink() or name == ".DS_Store" or name.startswith("._"):
+                continue
+            found.append(path)
+    return found
+
+
+def _sniff_archive(path: Path) -> str | None:
+    try:
+        with path.open("rb") as handle:
+            first = handle.read(32)
+    except OSError:
+        return None
+    if first.startswith((b"# v2 git bundle", b"# v3 git bundle")):
+        return "bundle"
+    if first.startswith((b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")) and path.suffix.casefold() == ".zip":
+        return "zip"
+    return None
+
+
+def _source_manifest(root: Path, config: AppConfig) -> list[tuple[str, str]]:
+    subcfg = config.section("submissions")
+    cpp_exts = {str(x).casefold() for x in subcfg.get("cpp_extensions", [".cpp", ".cc", ".cxx"])}
+    header_exts = {str(x).casefold() for x in subcfg.get("header_extensions", [".h", ".hpp"])}
+    ignored = set(str(x) for x in subcfg.get("ignored_directories", [])) | {".git", ".gradle", "__MACOSX"}
+    max_files = int(subcfg.get("max_files", 300))
+    max_total = int(subcfg.get("max_total_bytes", 52_428_800))
+    max_single = int(subcfg.get("max_single_file_bytes", 10_485_760))
+    manifest: list[tuple[str, str]] = []
+    total = 0
+    for path in _walk_files(root, ignored):
+        ext = path.suffix.casefold()
+        if ext not in cpp_exts | header_exts:
+            continue
+        rel = path.relative_to(root).as_posix()
+        size = path.stat().st_size
+        if size > max_single or total + size > max_total:
+            raise InputValidationError(f"C++ source inventory under {root} exceeds configured size limits.")
+        total += size
+        manifest.append((rel, sha256_file(path)))
+        if len(manifest) > max_files:
+            raise InputValidationError(f"C++ source inventory under {root} exceeds max_files={max_files}.")
+    return sorted(manifest)
+
+
+def _copy_project(root: Path, destination: Path, config: AppConfig) -> int:
+    ignored = set(str(x) for x in config.section("submissions").get("ignored_directories", [])) | {
+        ".git", ".gradle", "__MACOSX", "node_modules"
+    }
+    max_materialized = int(config.section("archive_import").get("max_materialized_bytes_per_student", 536_870_912))
+    total = 0
+    destination.mkdir(parents=True, exist_ok=True)
+    for current, dirs, files in os.walk(root, followlinks=False):
+        base = Path(current)
+        rel_dir = base.relative_to(root)
+        dirs[:] = sorted(
+            name for name in dirs
+            if name not in ignored and not name.startswith("._") and name != ".DS_Store"
+            and not (base / name).is_symlink()
+        )
+        for name in sorted(files):
+            source = base / name
+            if source.is_symlink() or name.startswith("._") or name == ".DS_Store":
+                continue
+            if _sniff_archive(source):
+                continue
+            size = source.stat().st_size
+            total += size
+            if total > max_materialized:
+                raise InputValidationError(
+                    f"Extracted project exceeds max_materialized_bytes_per_student={max_materialized}."
+                )
+            target = destination / rel_dir / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+    return total
+
+
+def _clone_bundle(
+    bundle: Path,
+    destination: Path,
+    timeout: int,
+    max_file_bytes: int,
+    max_materialized_bytes: int,
+    memory_mb: int = 1024,
+) -> str | None:
+    """Materialize a local Git bundle with process-level resource bounds.
+
+    No network URL is accepted: the caller passes an archive file discovered within the
+    Moodle ZIP. Clone is executed in a new process group so timeout cleanup includes children.
+    """
+    if bundle.stat().st_size > max_file_bytes:
+        return f"Bundle exceeds max_archive_file_bytes={max_file_bytes}."
+    git = shutil.which("git")
+    if not git:
+        return "git executable not found; cannot materialize this bundle."
+    env = {
+        "PATH": "/usr/bin:/bin", "HOME": str(destination.parent), "LC_ALL": "C", "LANG": "C",
+        "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_TERMINAL_PROMPT": "0",
+        "GIT_ALLOW_PROTOCOL": "file",
+        # Limit Git's internal parallelism during bundle import.
+        "GIT_CONFIG_COUNT": "2",
+        "GIT_CONFIG_KEY_0": "pack.threads",
+        "GIT_CONFIG_VALUE_0": "1",
+        "GIT_CONFIG_KEY_1": "index.threads",
+        "GIT_CONFIG_VALUE_1": "1",
+    }
+
+    def set_limits() -> None:
+        cpu = max(1, int(timeout))
+        mem = max(256, int(memory_mb)) * 1024 * 1024
+        file_bytes = max(1, int(max_materialized_bytes))
+        resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu + 1))
+        resource.setrlimit(resource.RLIMIT_AS, (mem, mem))
+        resource.setrlimit(resource.RLIMIT_FSIZE, (file_bytes, file_bytes))
+        resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        # Do not apply RLIMIT_NPROC here: on Linux it can constrain
+        # all processes belonging to this real UID, not just this clone.
+
+    with tempfile.TemporaryFile() as log_file:
+        try:
+            proc = subprocess.Popen(
+                # The functional C++ grader needs the submitted checkout, not the full Git history.
+                # A shallow, single-branch clone avoids repeatedly materializing large histories.
+                # The original bundle is preserved elsewhere for any separate Git-history rubric.
+                [git, "clone", "--quiet", "--no-hardlinks", "--depth", "1", "--single-branch", "--no-tags", "--", str(bundle.resolve()), str(destination)],
+                stdin=subprocess.DEVNULL, stdout=log_file, stderr=subprocess.STDOUT,
+                env=env, start_new_session=True, preexec_fn=set_limits,
+            )
+            try:
+                return_code = proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                proc.wait()
+                return f"Bundle clone exceeded {timeout}s wall-clock timeout."
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            return f"Bundle clone failed: {type(exc).__name__}: {exc}"
+        if return_code != 0:
+            log_file.seek(0, os.SEEK_END)
+            length = log_file.tell()
+            log_file.seek(max(0, length - 700))
+            detail = log_file.read(700).decode("utf-8", "replace")
+            return f"Bundle clone returned {return_code}: {detail}"
+    return None
+
+
+def _candidate_roots(student_root: Path, scratch_root: Path, config: AppConfig) -> tuple[list[Path], list[str], list[str], dict[Path, str]]:
+    subcfg = config.section("submissions")
+    import_cfg = config.section("archive_import")
+    ignored = set(str(x) for x in subcfg.get("ignored_directories", [])) | {".git", ".gradle", "__MACOSX"}
+    max_depth = max(0, int(import_cfg.get("max_nested_archive_depth", 2)))
+    max_archives = max(1, int(import_cfg.get("max_archives_per_student", 20)))
+    max_archive_bytes = int(import_cfg.get("max_archive_file_bytes", 104_857_600))
+    max_archive_entries = int(import_cfg.get("max_entries_per_nested_zip", 10_000))
+    max_nested_bytes = int(import_cfg.get("max_uncompressed_bytes_per_student", 536_870_912))
+    git_timeout = int(import_cfg.get("git_clone_timeout_seconds", 120))
+    git_memory_mb = int(import_cfg.get("git_memory_mb", 1024))
+    max_materialized = int(import_cfg.get("max_materialized_bytes_per_student", 536_870_912))
+
+    roots: list[Path] = []
+    archive_names: list[str] = []
+    notes: list[str] = []
+    root_origins: dict[Path, str] = {}
+    budget = {"entries": 0, "bytes": 0}
+    # Include direct source files as a separate candidate when a submission combines loose files and archives.
+    try:
+        direct_manifest = _source_manifest(student_root, config)
+        if direct_manifest:
+            roots.append(student_root)
+            root_origins[student_root] = "loose files in the submitted folder"
+    except InputValidationError as exc:
+        notes.append(str(exc))
+
+    queue: list[tuple[Path, int, str]] = []
+    for path in _walk_files(student_root, ignored):
+        kind = _sniff_archive(path)
+        if kind:
+            queue.append((path, 0, path.relative_to(student_root).as_posix()))
+            archive_names.append(path.name)
+    if len(queue) > max_archives:
+        return roots, archive_names, [f"Submission contains more than max_archives_per_student={max_archives}."]
+
+    serial = 0
+    seen: set[Path] = set()
+    while queue:
+        archive_path, depth, origin = queue.pop(0)
+        try:
+            resolved = archive_path.resolve()
+        except OSError:
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if depth > max_depth:
+            notes.append(f"Nested archive depth exceeded ({archive_path.name}); skipped.")
+            continue
+        serial += 1
+        target = scratch_root / f"candidate_{serial:03d}"
+        try:
+            if archive_path.stat().st_size > max_archive_bytes:
+                notes.append(f"Archive {archive_path.name} exceeds max_archive_file_bytes; skipped.")
+                continue
+            kind = _sniff_archive(archive_path)
+            if kind == "bundle":
+                error = _clone_bundle(archive_path, target, git_timeout, max_archive_bytes,
+                                      max_materialized, git_memory_mb)
+                if error:
+                    notes.append(f"{archive_path.name}: {error}")
+                    shutil.rmtree(target, ignore_errors=True)
+                    continue
+            elif kind == "zip":
+                target.mkdir(parents=True, exist_ok=True)
+                safe_extract_zip(archive_path, target, max_entries=max_archive_entries,
+                                 max_uncompressed_bytes=max_nested_bytes, budget=budget)
+            else:
+                continue
+            roots.append(target)
+            root_origins[target] = origin
+            # Discover nested archives inside this extracted project, but never recurse into VCS/build junk.
+            if depth < max_depth:
+                for inner in _walk_files(target, ignored):
+                    if _sniff_archive(inner):
+                        nested_origin = f"{origin} -> {inner.relative_to(target).as_posix()}"
+                        queue.append((inner, depth + 1, nested_origin))
+                        archive_names.append(inner.name)
+                        if len(queue) + serial > max_archives:
+                            notes.append(f"Submission exceeds max_archives_per_student={max_archives}; nested discovery stopped.")
+                            queue.clear()
+                            break
+            # Keep git worktrees from exhausting storage by enforcing a post-checkout limit.
+            tree_bytes = sum(p.stat().st_size for p in _walk_files(target, ignored))
+            if tree_bytes > max_materialized:
+                notes.append(f"Materialized archive {archive_path.name} exceeds configured expanded-size limit; skipped.")
+                roots.remove(target)
+                shutil.rmtree(target, ignore_errors=True)
+        except InputValidationError as exc:
+            notes.append(f"{archive_path.name}: {exc}")
+            if target in roots:
+                roots.remove(target)
+            shutil.rmtree(target, ignore_errors=True)
+        except OSError as exc:
+            notes.append(f"{archive_path.name}: filesystem error: {exc}")
+            if target in roots:
+                roots.remove(target)
+            shutil.rmtree(target, ignore_errors=True)
+    return roots, sorted(set(archive_names)), notes, root_origins
+
+
+def _moodle_submission_dirs(root: Path) -> list[Path]:
+    children = [p for p in root.iterdir() if p.is_dir() and p.name not in {"__MACOSX", ".git"} and not p.name.startswith(".")]
+    # Accommodate one wrapper directory if it contains the actual Moodle student directories.
+    if len(children) == 1:
+        only = children[0]
+        grandchildren = [p for p in only.iterdir() if p.is_dir() and not p.name.startswith(".") and p.name != "__MACOSX"]
+        if grandchildren and any(re.search(r"\._\s*\d+_assignsubmission", p.name, re.IGNORECASE) for p in grandchildren):
+            children = grandchildren
+    return sorted(children, key=lambda p: p.name.casefold())
+
+
+def prepare_moodle_archive(config: AppConfig, archive: Path, destination: Path, *, replace_existing: bool = False) -> dict[str, Any]:
+    """Normalize a Moodle export ZIP into one folder per student, keeping only C++ project sources.
+
+    The original archive is never modified. The destination is updated only after the full
+    archive has been extracted and inspected in a temporary staging tree.
+    """
+    archive = archive.expanduser().resolve()
+    if not archive.is_file() or not zipfile.is_zipfile(archive):
+        raise InputValidationError(f"Moodle export must be a readable ZIP file: {archive}")
+    destination = destination.expanduser().resolve()
+    import_cfg = config.section("archive_import")
+    max_outer_bytes = int(import_cfg.get("max_outer_uncompressed_bytes", 1_073_741_824))
+    max_outer_entries = int(import_cfg.get("max_outer_entries", 30_000))
+    outer_budget = {"entries": 0, "bytes": 0}
+
+    existing = [p for p in destination.iterdir() if p.name not in {"README.md", ".gitkeep", ".cpp_grader_import_summary.json"}] if destination.is_dir() else []
+    existing_student_dirs = [p for p in existing if p.is_dir()]
+    other_existing = [p for p in existing if not p.is_dir()]
+    if (existing_student_dirs or other_existing) and not replace_existing:
+        raise InputValidationError(
+            f"Destination {destination} already contains files/subdirectories. Choose a new destination or pass --replace-existing."
+        )
+    if not destination.exists():
+        destination.mkdir(parents=True, exist_ok=True)
+    if not destination.is_dir():
+        raise InputValidationError(f"Destination is not a directory: {destination}")
+
+    warnings: list[str] = []
+    statuses: Counter[str] = Counter()
+    staged_folders: list[Path] = []
+    with tempfile.TemporaryDirectory(prefix="cpp-grader-archive-") as temp_name:
+        temp = Path(temp_name)
+        unpacked = temp / "outer"
+        unpacked.mkdir()
+        safe_extract_zip(archive, unpacked, max_entries=max_outer_entries,
+                         max_uncompressed_bytes=max_outer_bytes, budget=outer_budget)
+        student_dirs = _moodle_submission_dirs(unpacked)
+        if not student_dirs:
+            raise InputValidationError("No student submission folders were found at the ZIP top level.")
+        # Refuse the repository ZIP instead of silently treating its folders as students.
+        if len(student_dirs) == 1 and student_dirs[0].name.casefold() in {"oop_ta", "oop-ta", "repository"}:
+            raise InputValidationError(
+                "This appears to be the grader repository archive, not the Moodle submission export. "
+                "Pass the Moodle export ZIP (the one with one student folder per entry)."
+            )
+
+        processed = temp / "processed"
+        processed.mkdir()
+        for student_dir in student_dirs:
+            safe_id = hashlib.sha256(str(student_dir.relative_to(unpacked)).encode("utf-8")).hexdigest()[:16]
+            scratch = temp / "scratch" / safe_id
+            scratch.mkdir(parents=True, exist_ok=True)
+            out_student = processed / student_dir.name
+            out_student.mkdir(parents=True, exist_ok=True)
+            roots, archive_names, notes, root_origins = _candidate_roots(student_dir, scratch, config)
+            manifests: list[tuple[Path, list[tuple[str, str]]]] = []
+            for root in roots:
+                try:
+                    manifest = _source_manifest(root, config)
+                except InputValidationError as exc:
+                    notes.append(str(exc))
+                    continue
+                if any(Path(rel).suffix.casefold() in {str(x).casefold() for x in config.section("submissions").get("cpp_extensions", [])} for rel, _ in manifest):
+                    manifests.append((root, manifest))
+            distinct: dict[tuple[tuple[str, str], ...], Path] = {}
+            for root, manifest in manifests:
+                distinct.setdefault(tuple(manifest), root)
+
+            # Retain auditable source inventories for ambiguous submissions.
+            # Never choose between distinct implementations automatically.
+            candidate_details = [
+                {
+                    "root_name": root.name,
+                    "origin": root_origins.get(root, "origin unavailable"),
+                    "source_files": [
+                        {"path": rel, "sha256": digest}
+                        for rel, digest in manifest_key
+                    ],
+                }
+                for manifest_key, root in distinct.items()
+            ]
+
+            if len(distinct) == 1:
+                selected_root = next(iter(distinct.values()))
+                try:
+                    _copy_project(selected_root, out_student / "source", config)
+                    status = "READY"
+                    issue = ""
+                except InputValidationError as exc:
+                    status = "IMPORT_ERROR"
+                    issue = str(exc)
+            elif len(distinct) > 1:
+                status = "AMBIGUOUS_PROJECT_ROOT"
+                issue = "Multiple different C++ project roots were found in this submission; choose one manually."
+            elif notes and not roots:
+                status = "IMPORT_ERROR"
+                issue = "No project root could be materialized: " + " | ".join(notes[:5])
+            else:
+                status = "NO_CPP_SOURCE"
+                issue = "No C++ source files were found in loose files, ZIP archives, or Git bundles."
+            statuses[status] += 1
+            manifest = {
+                "schema_version": 1, "status": status, "original_submission_folder": student_dir.name,
+                "archive_names": archive_names, "candidate_cpp_roots": len(manifests),
+                "candidate_details": (
+                    candidate_details if status == "AMBIGUOUS_PROJECT_ROOT" else []
+                ),
+                "issue": issue, "notes": notes[:30],
+            }
+            json_write(out_student / ".cpp_grader_import.json", manifest)
+            staged_folders.append(out_student)
+        # Transactional-ish commit: back up existing submission folders if replacement was explicit.
+        backup = temp / "backup"
+        backup.mkdir()
+        moved_old: list[tuple[Path, Path]] = []
+        copied_new: list[Path] = []
+        try:
+            if replace_existing:
+                for old in existing:
+                    backup_target = backup / old.name
+                    shutil.move(str(old), str(backup_target))
+                    moved_old.append((backup_target, old))
+            for folder in staged_folders:
+                target = destination / folder.name
+                if target.exists():
+                    raise InputValidationError(f"Destination collision for student folder {folder.name!r}.")
+                shutil.copytree(folder, target, symlinks=False)
+                copied_new.append(target)
+        except Exception:
+            for path in copied_new:
+                shutil.rmtree(path, ignore_errors=True)
+            for old_location, original_location in reversed(moved_old):
+                if old_location.exists():
+                    shutil.move(str(old_location), str(original_location))
+            raise
+
+    summary = ArchiveImportSummary(
+        archive=str(archive), destination=str(destination), student_folders=len(staged_folders),
+        ready_cpp_submissions=statuses["READY"], no_cpp_source=statuses["NO_CPP_SOURCE"],
+        ambiguous_roots=statuses["AMBIGUOUS_PROJECT_ROOT"], import_errors=statuses["IMPORT_ERROR"],
+        warnings=tuple(warnings),
+    ).to_dict()
+    summary["status_counts"] = dict(sorted(statuses.items()))
+    json_write(destination / ".cpp_grader_import_summary.json", summary)
+    return summary

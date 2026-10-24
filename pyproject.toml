@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "oop-ta-cpp-grader"
+version = "1.0.0"
+description = "Resource-aware, rubric-driven C++ grader for the CS F213 OOP Lab Midsem ride-sharing assignment"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "openpyxl>=3.1.2",
+  "PyYAML>=6.0",
+  "PyMuPDF>=1.23",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.0"]
+
+[project.scripts]
+cpp-grader = "cpp_grader.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["cpp_grader*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.setuptools.package-data]
+cpp_grader = ["harness/*.cpp"]

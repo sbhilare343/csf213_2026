@@ -1,0 +1,196 @@
+from __future__ import annotations
+from collections import defaultdict
+from difflib import SequenceMatcher
+import json
+from pathlib import Path
+import re
+from typing import Any
+from .config import AppConfig
+from .models import Student, Submission
+from .utils import norm
+
+
+def _ignored_parts(parts: tuple[str, ...], ignored: set[str]) -> bool:
+    return any(p in ignored or p.startswith("._") for p in parts)
+
+
+def collect_sources(folder: Path, config: AppConfig) -> tuple[tuple[str, ...], tuple[str, ...], str]:
+    subcfg = config.section("submissions")
+    cpp_exts = {str(x).casefold() for x in subcfg.get("cpp_extensions", [".cpp", ".cc", ".cxx"])}
+    header_exts = {str(x).casefold() for x in subcfg.get("header_extensions", [".h", ".hpp"])}
+    ignored = set(str(x) for x in subcfg.get("ignored_directories", [".git", "build", "node_modules", "__MACOSX"]))
+    max_files = int(subcfg.get("max_files", 300))
+    max_total = int(subcfg.get("max_total_bytes", 52_428_800))
+    max_single = int(subcfg.get("max_single_file_bytes", 10_485_760))
+    sources: list[str] = []
+    headers: list[str] = []
+    total = 0
+    all_count = 0
+    for path in sorted(folder.rglob("*")):
+        try:
+            relative = path.relative_to(folder)
+        except ValueError:
+            continue
+        if _ignored_parts(relative.parts, ignored):
+            continue
+        if path.is_symlink():
+            continue
+        if not path.is_file():
+            continue
+        ext = path.suffix.casefold()
+        if ext not in cpp_exts and ext not in header_exts:
+            continue
+        all_count += 1
+        if all_count > max_files:
+            return (), (), f"Submission contains more than configured max_files={max_files} C++ source/header files."
+        size = path.stat().st_size
+        if size > max_single:
+            return (), (), f"File {relative.as_posix()} is larger than max_single_file_bytes={max_single}."
+        total += size
+        if total > max_total:
+            return (), (), f"Submission exceeds max_total_bytes={max_total}."
+        rel = relative.as_posix()
+        if ext in cpp_exts:
+            sources.append(rel)
+        else:
+            headers.append(rel)
+    return tuple(sources), tuple(headers), ""
+
+
+def _extract_id(candidate: str, pattern: str, roster_norms: dict[str, Student]) -> str | None:
+    try:
+        rx = re.compile(pattern, re.IGNORECASE)
+    except re.error as exc:
+        raise ValueError(f"Invalid submissions.student_id_regex: {exc}") from exc
+    for match in rx.finditer(candidate):
+        value = match.groupdict().get("student_id") or match.group(0)
+        key = norm(value)
+        if key in roster_norms:
+            return roster_norms[key].student_id
+    return None
+
+
+def _clean_submission_name(name: str) -> str:
+    # Moodle export folder convention: "FULL NAME ._123456_assignsubmission_file_".
+    name = re.split(r"\s*\._\s*\d+_assignsubmission_file_", name, maxsplit=1, flags=re.IGNORECASE)[0]
+    name = re.sub(r"(?:_assignsubmission_file_.*)$", "", name, flags=re.IGNORECASE)
+    return norm(name)
+
+
+def match_submissions(config: AppConfig, roster: list[Student]) -> tuple[dict[str, list[Submission]], list[Submission], list[str]]:
+    root = config.path_value("paths", "submissions_dir")
+    if root is None:
+        return {}, [], ["paths.submissions_dir is not configured."]
+    if not root.exists():
+        return {}, [], [f"Submissions directory does not exist: {root}"]
+    if not root.is_dir():
+        return {}, [], [f"Submissions path is not a directory: {root}"]
+    warnings: list[str] = []
+    roster_map = {norm(s.student_id): s for s in roster}
+    name_map: dict[str, list[Student]] = defaultdict(list)
+    for s in roster:
+        name_map[norm(s.name)].append(s)
+    id_pattern = str(config.section("submissions").get("student_id_regex", r"(?P<student_id>20[0-9]{2}[A-Za-z0-9]{5,}G)"))
+    try:
+        # Compile once so a bad regex becomes a configuration-level warning.
+        re.compile(id_pattern, re.IGNORECASE)
+    except re.error as exc:
+        return {}, [], [f"Invalid submissions.student_id_regex: {exc}"]
+
+    candidates = [p for p in sorted(root.iterdir(), key=lambda p: p.name.casefold()) if p.is_dir() and not p.name.startswith(".")]
+    # Directory-per-student is the supported mode. Top-level loose .cpp files are intentionally not guessed.
+    if not candidates:
+        loose = list(root.glob("*.cpp")) + list(root.glob("*.cc")) + list(root.glob("*.cxx"))
+        if loose:
+            warnings.append("Found loose C++ files directly under submissions/. Move each student's files into a separate subdirectory named with their campus ID.")
+        else:
+            warnings.append("No student submission directories found. The project is ready, but no submissions have been graded.")
+
+    by_student: dict[str, list[Submission]] = defaultdict(list)
+    unmatched: list[Submission] = []
+    for folder in candidates:
+        import_metadata: dict[str, Any] = {}
+        metadata_path = folder / ".cpp_grader_import.json"
+        if metadata_path.is_file():
+            try:
+                loaded = json.loads(metadata_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    import_metadata = loaded
+            except (OSError, json.JSONDecodeError) as exc:
+                warnings.append(f"Could not read archive import manifest in {folder.name}: {exc}")
+                import_metadata = {"status": "IMPORT_ERROR", "issue": "Archive import manifest is unreadable."}
+
+        source_root = folder / "source" if import_metadata and (folder / "source").is_dir() else folder
+        sources, headers, file_error = collect_sources(source_root, config)
+        names_to_search = [folder.name]
+        archive_names = import_metadata.get("archive_names", [])
+        if isinstance(archive_names, list):
+            names_to_search.extend(str(x) for x in archive_names)
+        if not file_error:
+            # Filenames sometimes contain a campus ID even when the enclosing directory does not.
+            for rel in (*sources, *headers):
+                names_to_search.append(rel)
+        student: Student | None = None
+        matched_by = ""
+        for candidate in names_to_search:
+            found = _extract_id(candidate, id_pattern, roster_map)
+            if found:
+                student = roster_map[norm(found)]
+                matched_by = "campus_id"
+                break
+        if student is None:
+            name_key = _clean_submission_name(folder.name)
+            exact = name_map.get(name_key, [])
+            if len(exact) == 1:
+                student, matched_by = exact[0], "normalized_name"
+            elif len(exact) > 1:
+                sub = Submission(str(source_root.resolve()), folder.name, None, "AMBIGUOUS_IDENTITY", sources, headers,
+                                 issue="Folder name matches more than one roster record.")
+                unmatched.append(sub)
+                continue
+            else:
+                close = []
+                for roster_name, people in name_map.items():
+                    similarity = SequenceMatcher(None, name_key, roster_name).ratio() if name_key and roster_name else 0
+                    if similarity >= 0.94:
+                        close.extend(people)
+                if len(close) == 1:
+                    student, matched_by = close[0], "close_name_review"
+                elif len(close) > 1:
+                    unmatched.append(Submission(str(source_root.resolve()), folder.name, None, "AMBIGUOUS_IDENTITY", sources, headers,
+                                                issue="Folder name is similar to multiple roster names."))
+                    continue
+        if student is None:
+            metadata_issue = str(import_metadata.get("issue", ""))
+            unmatched.append(Submission(str(source_root.resolve()), folder.name, None, "UNMATCHED_SUBMISSION", sources, headers,
+                                        issue=file_error or metadata_issue or "Could not match folder to an attendance record using campus ID or name."))
+            continue
+        imported_status = str(import_metadata.get("status", ""))
+        imported_issue = str(import_metadata.get("issue", ""))
+        if matched_by == "close_name_review":
+            status = "AMBIGUOUS_IDENTITY"
+            issue = "Name-only fuzzy match needs human confirmation; it is not safe to grade automatically."
+        elif imported_status and imported_status != "READY":
+            status_map = {
+                "NO_CPP_SOURCE": "NO_CPP_SOURCE",
+                "AMBIGUOUS_PROJECT_ROOT": "AMBIGUOUS_PROJECT_ROOT",
+                "IMPORT_ERROR": "INPUT_IMPORT_ERROR",
+            }
+            status = status_map.get(imported_status, "INPUT_IMPORT_ERROR")
+            issue = imported_issue or f"Archive importer status: {imported_status}."
+        elif file_error:
+            status, issue = "INPUT_LIMIT_EXCEEDED", file_error
+        elif not sources:
+            status, issue = "NO_CPP_SOURCE", "No .cpp/.cc/.cxx source files found. Java bundles or other files are not graded as C++."
+        else:
+            status, issue = "FOUND", ""
+        sub = Submission(str(source_root.resolve()), folder.name, student.student_id, status, sources, headers, matched_by, issue)
+        by_student[norm(student.student_id)].append(sub)
+
+    # More than one candidate for a student is held for manual resolution, never silently selected.
+    for student_key, items in list(by_student.items()):
+        if len(items) > 1:
+            by_student[student_key] = [Submission(x.folder, x.folder_name, x.student_id, "DUPLICATE_SUBMISSIONS",
+                                                 x.source_files, x.header_files, x.matched_by,
+                                                 "Multiple submission folders matched this student.") for x in items]
+    return dict(by_student), unmatched, warnings
